@@ -1,6 +1,10 @@
 'use client'
 
-import React, { useState, useRef, useCallback, useEffect } from 'react'
+import React, { useState, useRef, useCallback, useEffect, useMemo } from 'react'
+import { MIDI_FILES } from '@/lib/midiFiles'
+
+const formatName = (s: string) =>
+  s.replace(/[-_]/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -163,9 +167,16 @@ export function MobileSynth() {
   const [rainOn, setRainOn] = useState(false)
   const [pos, setPos] = useState(0)
   const [midiVol, setMidiVol] = useState(0.7)
+  const [search, setSearch] = useState('')
+  const [loading, setLoading] = useState(false)
   const fireIntRef = useRef(0.6)
   const rainIntRef = useRef(0.6)
   const [, forceRender] = useState(0)
+
+  const filtered = useMemo(() =>
+    MIDI_FILES.filter(f => f.toLowerCase().includes(search.toLowerCase())),
+    [search]
+  )
 
   const ctx = useRef<AudioContext | null>(null)
   const master = useRef<GainNode | null>(null)
@@ -437,21 +448,24 @@ export function MobileSynth() {
     setRainOn(false)
   }, [])
 
-  // ── File load ──────────────────────────────────────────────────────────────
-  const onMidiFile = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
+  // ── Load MIDI from public folder ───────────────────────────────────────────
+  const loadMidi = useCallback(async (name: string) => {
+    if (playing) stopMidi()
+    setLoading(true)
     try {
-      const buf = await file.arrayBuffer()
+      const res = await fetch(`/midi/${name}.mid`)
+      if (!res.ok) throw new Error('fetch failed')
+      const buf = await res.arrayBuffer()
       const parsed = parseMidi(buf)
       setMidiData(parsed)
-      setMidiFile(file.name)
+      setMidiFile(name)
       setPos(0)
     } catch {
-      alert('Could not read MIDI file — make sure it is a valid .mid file.')
+      alert(`Could not load ${name}`)
+    } finally {
+      setLoading(false)
     }
-    e.target.value = '' // allow reloading same file
-  }, [])
+  }, [playing, stopMidi])
 
   // ── Start screen (required for iOS AudioContext unlock) ────────────────────
   if (!ready) {
@@ -487,18 +501,20 @@ export function MobileSynth() {
 
         {/* ── MIDI Player ── */}
         <section className="bg-gray-900 rounded-2xl p-4 border border-gray-800">
-          <h2 className="text-sm font-semibold text-blue-400 uppercase tracking-wider mb-3">MIDI Player</h2>
+          <h2 className="text-sm font-semibold text-blue-400 uppercase tracking-wider mb-3">
+            MIDI Player {loading && <span className="text-gray-500 normal-case font-normal">loading…</span>}
+          </h2>
 
-          <label className="flex items-center justify-center gap-2 bg-gray-800 hover:bg-gray-700 active:bg-gray-600 rounded-xl px-4 py-3 cursor-pointer transition-colors mb-3">
-            <span className="text-gray-300 text-sm truncate max-w-[220px]">
-              {midiFile ?? '📂  Load MIDI File'}
-            </span>
-            <input type="file" accept=".mid,.midi" onChange={onMidiFile} className="hidden" />
-          </label>
+          {/* Now playing */}
+          {midiFile && (
+            <div className="text-white text-sm font-medium mb-2 truncate">
+              ♩ {formatName(midiFile)}
+            </div>
+          )}
 
-          {midiData ? (
-            <div className="space-y-3">
-              {/* Progress bar */}
+          {/* Progress + transport */}
+          {midiData && (
+            <div className="space-y-3 mb-3">
               <div className="relative h-1.5 bg-gray-700 rounded-full overflow-hidden">
                 <div
                   className="absolute inset-y-0 left-0 bg-blue-500 rounded-full transition-all"
@@ -510,37 +526,57 @@ export function MobileSynth() {
                 <span>{midiData.notes.length} notes · {Math.round(midiData.bpm)} BPM</span>
                 <span>{fmt(midiData.duration)}</span>
               </div>
-
-              {/* Play / Stop */}
               <button
                 onClick={playing ? stopMidi : playMidi}
-                className={`w-full py-3.5 rounded-xl font-bold text-base transition-all active:scale-95 ${
+                className={`w-full py-3 rounded-xl font-bold text-base transition-all active:scale-95 ${
                   playing ? 'bg-red-600 hover:bg-red-500' : 'bg-blue-600 hover:bg-blue-500'
                 }`}
               >
                 {playing ? '⏹  Stop' : '▶  Play'}
               </button>
-
-              {/* MIDI Volume */}
               <div>
                 <div className="flex justify-between text-xs text-gray-500 mb-1">
-                  <span>Volume</span>
-                  <span>{Math.round(midiVol * 100)}%</span>
+                  <span>Volume</span><span>{Math.round(midiVol * 100)}%</span>
                 </div>
-                <input
-                  type="range" min="0" max="1" step="0.01" value={midiVol}
-                  onChange={e => {
-                    const v = parseFloat(e.target.value)
-                    setMidiVol(v)
-                    if (midiGain.current) midiGain.current.gain.value = v
-                  }}
+                <input type="range" min="0" max="1" step="0.01" value={midiVol}
+                  onChange={e => { const v = parseFloat(e.target.value); setMidiVol(v); if (midiGain.current) midiGain.current.gain.value = v }}
                   className="w-full accent-blue-400"
                 />
               </div>
             </div>
-          ) : (
-            <p className="text-gray-600 text-xs text-center py-2">Load a .mid file to play it</p>
           )}
+
+          {/* Song browser */}
+          <input
+            type="search"
+            placeholder="Search 417 Bach pieces…"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            className="w-full bg-gray-800 text-white text-sm rounded-xl px-3 py-2.5 mb-2 outline-none placeholder-gray-600 border border-gray-700 focus:border-blue-500"
+          />
+          <div className="overflow-y-auto max-h-56 rounded-xl border border-gray-800 divide-y divide-gray-800">
+            {filtered.slice(0, 100).map(name => (
+              <button
+                key={name}
+                onClick={() => loadMidi(name)}
+                className={`w-full text-left px-3 py-2.5 text-sm transition-colors active:bg-blue-900/40 ${
+                  midiFile === name
+                    ? 'bg-blue-900/50 text-blue-300'
+                    : 'text-gray-300 hover:bg-gray-800'
+                }`}
+              >
+                {formatName(name)}
+              </button>
+            ))}
+            {filtered.length === 0 && (
+              <p className="text-gray-600 text-xs text-center py-4">No results</p>
+            )}
+            {filtered.length > 100 && (
+              <p className="text-gray-600 text-xs text-center py-2">
+                Showing 100 of {filtered.length} — search to narrow
+              </p>
+            )}
+          </div>
         </section>
 
         {/* ── Fire Crackle ── */}
