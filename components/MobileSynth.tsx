@@ -156,6 +156,45 @@ function parseMidi(buffer: ArrayBuffer): MidiData {
 const midiToFreq = (note: number) => 440 * Math.pow(2, (note - 69) / 12)
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
 
+// ─── Sound presets ────────────────────────────────────────────────────────────
+
+type SoundType = 'piano' | 'organ' | 'pad' | 'synth'
+
+const PRESETS: Record<SoundType, {
+  osc1: OscillatorType; osc2: OscillatorType
+  detune: number          // cents, osc2 offset
+  osc2Ratio: number       // freq multiplier for osc2 (1 = same, 2 = octave up)
+  osc2Gain: number        // 0-1 relative to osc1
+  attack: number; decay: number; sustain: number; release: number
+  filterBase: number; filterPeak: number; filterQ: number
+}> = {
+  piano:  { osc1:'sawtooth', osc2:'triangle',  detune:6,  osc2Ratio:1,   osc2Gain:0.6,
+             attack:0.005, decay:0.14, sustain:0.4, release:0.45,
+             filterBase:700, filterPeak:4500, filterQ:1.4 },
+  organ:  { osc1:'sine',     osc2:'sine',       detune:0,  osc2Ratio:2,   osc2Gain:0.45,
+             attack:0.008, decay:0,    sustain:1.0, release:0.03,
+             filterBase:2800, filterPeak:0, filterQ:0.3 },
+  pad:    { osc1:'triangle', osc2:'triangle',   detune:11, osc2Ratio:1,   osc2Gain:0.8,
+             attack:0.38,  decay:0.5,  sustain:0.65, release:1.3,
+             filterBase:300, filterPeak:2200, filterQ:2.8 },
+  synth:  { osc1:'sawtooth', osc2:'square',     detune:7,  osc2Ratio:1,   osc2Gain:0.5,
+             attack:0.008, decay:0.09, sustain:0.52, release:0.22,
+             filterBase:180, filterPeak:6500, filterQ:4.5 },
+}
+
+// Generate a synthetic hall reverb impulse response
+function buildReverbIR(actx: AudioContext, duration = 2.8, decay = 1.8): AudioBuffer {
+  const len = Math.ceil(actx.sampleRate * duration)
+  const ir = actx.createBuffer(2, len, actx.sampleRate)
+  for (let c = 0; c < 2; c++) {
+    const d = ir.getChannelData(c)
+    for (let i = 0; i < len; i++) {
+      d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay)
+    }
+  }
+  return ir
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export function MobileSynth() {
@@ -169,9 +208,19 @@ export function MobileSynth() {
   const [midiVol, setMidiVol] = useState(0.7)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(false)
+  const [soundType, setSoundType] = useState<SoundType>('piano')
+  const soundTypeRef = useRef<SoundType>('piano')
+  const reverbAmtRef = useRef(0.35)
+  const delayAmtRef = useRef(0.22)
   const fireIntRef = useRef(0.6)
   const rainIntRef = useRef(0.6)
   const [, forceRender] = useState(0)
+
+  // Effects refs
+  const preFxRef = useRef<GainNode | null>(null)
+  const reverbGainRef = useRef<GainNode | null>(null)
+  const delayWetRef = useRef<GainNode | null>(null)
+  const delayFbRef = useRef<GainNode | null>(null)
 
   const filtered = useMemo(() =>
     MIDI_FILES.filter(f => f.toLowerCase().includes(search.toLowerCase())),
@@ -245,12 +294,41 @@ export function MobileSynth() {
     mg.gain.value = 0.85
     mg.connect(comp)
 
-    // Dedicated MIDI gain (so user can adjust MIDI volume independently)
+    // MIDI volume gain
     const mGain = actx.createGain()
     mGain.gain.value = midiVol
     mGain.connect(mg)
 
-    // White noise buffer (3 sec, looped for fire/rain)
+    // ── Effects chain: voices → preFx → dry + reverb + delay → mGain ──
+    const preFx = actx.createGain()
+    preFx.gain.value = 1
+
+    // Reverb
+    const reverb = actx.createConvolver()
+    reverb.buffer = buildReverbIR(actx)
+    const reverbGain = actx.createGain()
+    reverbGain.gain.value = reverbAmtRef.current
+    preFx.connect(reverb)
+    reverb.connect(reverbGain)
+    reverbGain.connect(mGain)
+
+    // Delay with feedback
+    const delay = actx.createDelay(1.0)
+    delay.delayTime.value = 0.28
+    const delayFb = actx.createGain()
+    delayFb.gain.value = 0.32
+    const delayWet = actx.createGain()
+    delayWet.gain.value = delayAmtRef.current
+    preFx.connect(delay)
+    delay.connect(delayFb)
+    delayFb.connect(delay)   // feedback loop
+    delay.connect(delayWet)
+    delayWet.connect(mGain)
+
+    // Dry signal
+    preFx.connect(mGain)
+
+    // White noise buffer (3 sec, for fire/rain)
     const bufLen = actx.sampleRate * 3
     const nb = actx.createBuffer(1, bufLen, actx.sampleRate)
     const nd = nb.getChannelData(0)
@@ -259,6 +337,10 @@ export function MobileSynth() {
     ctx.current = actx
     master.current = mg
     midiGain.current = mGain
+    preFxRef.current = preFx
+    reverbGainRef.current = reverbGain
+    delayWetRef.current = delayWet
+    delayFbRef.current = delayFb
     noiseBuffer.current = nb
     setReady(true)
   }, [midiVol])
@@ -266,39 +348,62 @@ export function MobileSynth() {
   // ── MIDI note playback ─────────────────────────────────────────────────────
   const playNote = useCallback((note: MidiNote, startAt: number) => {
     const actx = ctx.current
-    const dest = midiGain.current
+    const dest = preFxRef.current
     if (!actx || !dest) return
 
-    const osc = actx.createOscillator()
-    const env = actx.createGain()
-    const filt = actx.createBiquadFilter()
-
-    osc.type = 'triangle'
-    osc.frequency.value = midiToFreq(note.note)
-    filt.type = 'lowpass'
-    filt.frequency.value = 3500
-    filt.Q.value = 0.8
-
+    const p = PRESETS[soundTypeRef.current]
+    const freq = midiToFreq(note.note)
     const vel = note.velocity / 127
-    const atk = startAt + 0.008
-    const dec = atk + 0.08
     const rel = startAt + note.duration
-    const end = rel + 0.25
+    const end = rel + p.release + 0.05
 
+    // Oscillator 1 (primary)
+    const osc1 = actx.createOscillator()
+    osc1.type = p.osc1
+    osc1.frequency.value = freq
+
+    // Oscillator 2 (secondary — detuned or harmonic)
+    const osc2 = actx.createOscillator()
+    osc2.type = p.osc2
+    osc2.frequency.value = freq * p.osc2Ratio
+    osc2.detune.value = p.detune
+
+    const osc2Gain = actx.createGain()
+    osc2Gain.gain.value = p.osc2Gain
+
+    // Lowpass filter with envelope
+    const filt = actx.createBiquadFilter()
+    filt.type = 'lowpass'
+    filt.Q.value = p.filterQ
+    const fBase = p.filterBase
+    const fPeak = fBase + p.filterPeak * vel
+    filt.frequency.setValueAtTime(fBase, startAt)
+    filt.frequency.linearRampToValueAtTime(fPeak, startAt + p.attack + p.decay * 0.5)
+    filt.frequency.exponentialRampToValueAtTime(Math.max(fBase * 0.8, 80), rel)
+    filt.frequency.exponentialRampToValueAtTime(Math.max(fBase * 0.4, 60), end)
+
+    // Amplitude envelope (ADSR)
+    const env = actx.createGain()
+    const atkEnd = startAt + p.attack
+    const decEnd = atkEnd + p.decay
     env.gain.setValueAtTime(0, startAt)
-    env.gain.linearRampToValueAtTime(vel, atk)
-    env.gain.exponentialRampToValueAtTime(vel * 0.65, dec)
-    env.gain.setValueAtTime(vel * 0.65, rel)
+    env.gain.linearRampToValueAtTime(vel, atkEnd)
+    env.gain.exponentialRampToValueAtTime(Math.max(vel * p.sustain, 0.0001), decEnd)
+    env.gain.setValueAtTime(Math.max(vel * p.sustain, 0.0001), rel)
     env.gain.exponentialRampToValueAtTime(0.0001, end)
 
-    osc.connect(filt)
+    // Wire up: osc1 + osc2 → filter → env → preFx (effects chain)
+    osc1.connect(filt)
+    osc2.connect(osc2Gain)
+    osc2Gain.connect(filt)
     filt.connect(env)
     env.connect(dest)
 
-    osc.start(startAt)
-    osc.stop(end)
-    activeOscs.current.add(osc)
-    osc.onended = () => activeOscs.current.delete(osc)
+    osc1.start(startAt); osc1.stop(end)
+    osc2.start(startAt); osc2.stop(end)
+
+    activeOscs.current.add(osc1)
+    osc1.onended = () => activeOscs.current.delete(osc1)
   }, [])
 
   // ── Lookahead scheduler (avoids scheduling thousands of nodes at once) ─────
@@ -576,6 +681,60 @@ export function MobileSynth() {
                 Showing 100 of {filtered.length} — search to narrow
               </p>
             )}
+          </div>
+        </section>
+
+        {/* ── Sound ── */}
+        <section className="bg-gray-900 rounded-2xl p-4 border border-gray-800">
+          <h2 className="text-sm font-semibold text-purple-400 uppercase tracking-wider mb-3">Sound</h2>
+
+          {/* Preset buttons */}
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            {(['piano','organ','pad','synth'] as SoundType[]).map(t => (
+              <button
+                key={t}
+                onClick={() => { setSoundType(t); soundTypeRef.current = t }}
+                className={`py-2.5 rounded-xl text-sm font-bold capitalize transition-all active:scale-95 ${
+                  soundType === t
+                    ? 'bg-purple-600 text-white'
+                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                }`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
+
+          {/* Reverb */}
+          <div className="mb-3">
+            <div className="flex justify-between text-xs text-gray-500 mb-1">
+              <span>Reverb</span><span>{Math.round(reverbAmtRef.current * 100)}%</span>
+            </div>
+            <input type="range" min="0" max="0.9" step="0.01"
+              defaultValue={reverbAmtRef.current}
+              onChange={e => {
+                reverbAmtRef.current = parseFloat(e.target.value)
+                if (reverbGainRef.current) reverbGainRef.current.gain.value = reverbAmtRef.current
+                forceRender(n => n + 1)
+              }}
+              className="w-full accent-purple-400"
+            />
+          </div>
+
+          {/* Delay */}
+          <div>
+            <div className="flex justify-between text-xs text-gray-500 mb-1">
+              <span>Delay</span><span>{Math.round(delayAmtRef.current * 100)}%</span>
+            </div>
+            <input type="range" min="0" max="0.8" step="0.01"
+              defaultValue={delayAmtRef.current}
+              onChange={e => {
+                delayAmtRef.current = parseFloat(e.target.value)
+                if (delayWetRef.current) delayWetRef.current.gain.value = delayAmtRef.current
+                forceRender(n => n + 1)
+              }}
+              className="w-full accent-purple-400"
+            />
           </div>
         </section>
 
